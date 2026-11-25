@@ -88,8 +88,39 @@ incomplete marker. A failed gate leaves the candidate incomplete.
 
 Preparation stages package files. Validation checks metadata, distfile
 integrity, and whether Portage can resolve dependencies. Compilation,
-upstream test execution, runtime checks in a Wayland session, and
-publication are separate steps.
+upstream test execution, and runtime checks in a Wayland session are
+separate steps.
+
+## Snapshot updates on GitHub
+
+The **Prepare Luciole snapshot** workflow is scheduled for 06:43 UTC daily.
+To run it manually, select `main` in the Actions tab. Enable `dry_run` to
+report open-PR status, the current and proposed versions and SHAs, rotation,
+and upstream packaging changes without staging a candidate. Push and pull
+request CI runs the offline Python tests.
+
+The prepare job has read access to contents and pull requests. An open PR
+from this repository's `automation/luciole-<12 SHA characters>` namespace
+to `main` pauses candidate preparation. The publish job has write access to
+contents and pull requests. It downloads the artifact ID returned by the
+successful prepare job in the same run and checks the base commit, checksums,
+and exact package diff. The successful prepare job supplies the Gentoo
+validation evidence. The checksum check verifies the transferred files.
+
+The owner reviews the Draft PR, including upstream packaging changes and
+the ebuild and Manifest diff, completes any build or runtime checks needed
+for acceptance, then marks the PR ready and merges it manually. If a push
+succeeds but PR creation fails, rerun the workflow. It can reuse the branch
+when its only parent is the same base and its complete tree matches. An
+advanced base requires a fresh handoff. A conflicting branch stops the run
+and needs owner review.
+
+Keep `main` as the default branch for the schedule. In **Settings → Actions
+→ General**, enable **Allow GitHub Actions to create
+and approve pull requests** and allow the pinned `actions/checkout`,
+`actions/upload-artifact`, and `actions/download-artifact` revisions if
+the repository uses an action allowlist. Repository rules must allow the
+workflow to create `automation/luciole-*` branches. [GitHub Actions repository settings](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
 
 ## Build and session requirements
 

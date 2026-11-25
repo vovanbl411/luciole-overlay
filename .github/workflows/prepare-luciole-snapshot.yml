@@ -1,0 +1,106 @@
+name: Prepare Luciole snapshot
+
+on:
+  schedule:
+    - cron: '43 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report discovery without staging or publishing
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: luciole-snapshot
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'vovanbl411/luciole-overlay' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      publish_ready: ${{ steps.ready.outputs.publish_ready }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Record trusted base
+        shell: bash
+        run: |
+          base=$(git rev-parse HEAD)
+          test "$base" = "$GITHUB_SHA"
+          printf 'Base overlay commit %s\n' "$base" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run offline unit tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+      - name: Discover and optionally stage a candidate
+        id: discovery
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        shell: bash
+        run: |
+          args=(--stage-dir "$RUNNER_TEMP")
+          if [[ "$DRY_RUN" == true ]]; then
+            args=(--dry-run)
+          fi
+          python3 scripts/prepare_luciole.py "${args[@]}" --github-output "$GITHUB_OUTPUT" |
+            tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Validate the candidate and verify its handoff
+        if: steps.discovery.outputs.status == 'staged' && !inputs.dry_run
+        env:
+          STAGE_DIR: ${{ steps.discovery.outputs.stage_dir }}
+        shell: bash
+        run: |
+          python3 -B scripts/validate_luciole.py validate "$STAGE_DIR"
+          python3 -B scripts/validate_luciole.py verify "$STAGE_DIR/handoff"
+      - name: Upload the verified handoff
+        if: steps.discovery.outputs.status == 'staged' && !inputs.dry_run
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: luciole-handoff-${{ github.run_attempt }}
+          path: ${{ steps.discovery.outputs.stage_dir }}/handoff
+          if-no-files-found: error
+          retention-days: 2
+      - name: Mark the uploaded handoff ready
+        if: steps.upload.outputs.artifact-id != ''
+        id: ready
+        run: printf 'publish_ready=true\n' >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: prepare
+    if: >-
+      github.repository == 'vovanbl411/luciole-overlay' &&
+      github.ref == 'refs/heads/main' &&
+      needs.prepare.result == 'success' &&
+      needs.prepare.outputs.publish_ready == 'true' &&
+      needs.prepare.outputs.artifact_id != '' &&
+      !inputs.dry_run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Download the handoff from this run
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.prepare.outputs.artifact_id }}
+          path: ${{ runner.temp }}/luciole-handoff
+          merge-multiple: true
+      - name: Publish the verified snapshot as a draft PR
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/publish_luciole.py publish "$RUNNER_TEMP/luciole-handoff"

@@ -190,7 +190,7 @@ def handoff_metadata(commit: str, snapshots: list[prepare.Snapshot],
     }
 
 
-def verify_handoff(artifact: Path, commit: str, snapshots: list[prepare.Snapshot], base: dict[Path, bytes]) -> None:
+def verify_handoff(artifact: Path, commit: str, snapshots: list[prepare.Snapshot], base: dict[Path, bytes]) -> dict:
     if artifact.is_symlink() or not artifact.is_dir():
         raise gentoo.ValidationError("Expected a regular handoff directory.")
     metadata = read_json(artifact / "handoff.json")
@@ -208,6 +208,7 @@ def verify_handoff(artifact: Path, commit: str, snapshots: list[prepare.Snapshot
     if any(transferred[path] != content for path, content in ebuilds.items()):
         raise gentoo.ValidationError("Handoff ebuilds do not match the accepted template and candidate SHA.")
     verify_manifest(base, snapshots, receipt, transferred[MANIFEST])
+    return metadata
 
 
 def run_container(work: Path, repository: Path, result: Path,

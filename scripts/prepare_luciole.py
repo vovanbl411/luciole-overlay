@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from http.client import HTTPException
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -19,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = Path("gui-apps/luciole")
 UPSTREAM = "https://github.com/noctalia-dev/luciole"
 API = "https://api.github.com/repos/noctalia-dev/luciole"
+OVERLAY = "vovanbl411/luciole-overlay"
+AUTOMATION_REF = re.compile(r"automation/luciole-[0-9a-f]{12}")
 HTTP_TIMEOUT = 20
 SHA = re.compile(r"[0-9a-f]{40}")
 VERSION = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}"
@@ -97,25 +100,68 @@ def read_snapshots(package: Path) -> list[Snapshot]:
     return sorted(snapshots, key=lambda snapshot: snapshot.order)
 
 
-def github_json(path: str) -> dict:
-    request = Request(f"{API}/{path}", headers={
+def github_request(path: str, *, repository_api: str = API, payload: dict | None = None):
+    headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "luciole-overlay-prepare",
         "X-GitHub-Api-Version": "2022-11-28",
-    })
+    }
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    request = Request(
+        f"{repository_api}/{path}", data=json.dumps(payload).encode() if payload is not None else None,
+        headers=headers,
+    )
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         with urlopen(request, timeout=HTTP_TIMEOUT) as response:
-            payload = json.load(response)
+            return json.load(response)
     except HTTPError as error:
         error.close()
         raise PreparationError(f"GitHub API {path} failed with HTTP {error.code}.") from error
     except (URLError, OSError, HTTPException) as error:
-        raise PreparationError(f"GitHub API {path} failed ({error}).") from error
+        raise PreparationError(f"GitHub API {path} request failed.") from error
     except (ValueError, RecursionError) as error:
         raise PreparationError(f"Malformed JSON from GitHub API {path}.") from error
+
+
+def github_json(path: str) -> dict:
+    payload = github_request(path)
     if not isinstance(payload, dict):
         raise PreparationError(f"Expected a JSON object from GitHub API {path}.")
     return payload
+
+
+def overlay_request(path: str, *, payload: dict | None = None):
+    return github_request(path, repository_api=f"https://api.github.com/repos/{OVERLAY}", payload=payload)
+
+
+def open_snapshot_pr() -> int | None:
+    for page in range(1, 101):
+        pulls = overlay_request(f"pulls?state=open&base=main&per_page=100&page={page}")
+        if not isinstance(pulls, list) or len(pulls) > 100:
+            raise PreparationError("Malformed open pull request list.")
+        for pull in pulls:
+            number = field(pull, "number")
+            head_ref = field(pull, "head", "ref")
+            head = field(pull, "head")
+            head_repo = field(head, "repo", "full_name")
+            base_repo = field(pull, "base", "repo", "full_name")
+            base_ref = field(pull, "base", "ref")
+            if (
+                type(number) is not int or number < 1 or not isinstance(head_ref, str)
+                or "repo" not in head or (head["repo"] is not None and not isinstance(head_repo, str))
+                or not isinstance(base_repo, str) or not isinstance(base_ref, str)
+                or field(pull, "state") != "open"
+            ):
+                raise PreparationError("Malformed item in the open pull request list.")
+            if head_repo == base_repo == OVERLAY and base_ref == "main" and AUTOMATION_REF.fullmatch(head_ref):
+                return number
+        if len(pulls) < 100:
+            return None
+    raise PreparationError("Open pull request pagination limit reached.")
 
 
 def field(payload: object, *keys: str) -> object:
@@ -311,30 +357,64 @@ def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
         "--stage-dir", type=Path, metavar="PARENT",
         help="Create a candidate under this existing external directory.",
     )
+    parser.add_argument("--github-output", type=Path, help="Check open snapshot PRs and append Actions outputs.")
     options = parser.parse_args(argv)
     try:
         root = root.resolve()
+        output = None
+        if options.github_output is not None:
+            output = options.github_output.resolve()
+            if output.is_relative_to(root) or "\n" in str(output) or "\r" in str(output):
+                raise PreparationError("Actions output must be outside the checkout.")
         package = root / PACKAGE
         parent = None
         if options.stage_dir is not None:
             parent = options.stage_dir.resolve(strict=True)
             if not parent.is_dir() or parent.is_relative_to(root):
                 raise PreparationError("The staging parent must be a directory outside the checkout.")
+        result = {"status": "up_to_date", "has_candidate": "false", "candidate_sha": "",
+                  "candidate_version": "", "stage_dir": "", "open_pr": ""}
+        if output is not None:
+            number = open_snapshot_pr()
+            if number:
+                print(f"Automated Luciole snapshot PR #{number} is already open.")
+                result["open_pr"] = str(number)
+                if not options.dry_run:
+                    result["status"] = "open_pr"
+                    append_outputs(output, result)
+                    return 0
+            else:
+                print("No open automated Luciole snapshot PR.")
         plan = discover(package)
         if isinstance(plan, Snapshot):
             print(f"Luciole is up to date with upstream main ({plan.sha}): {plan.filename}")
-            return 0
-        print_plan(plan)
-        if options.dry_run:
-            print("Dry run. No candidate files created.")
         else:
-            staged = stage(package, parent, plan)
-            print(f"Staged candidate at {staged}")
-            print(INCOMPLETE)
+            result.update(
+                status="dry_run" if options.dry_run else "staged", has_candidate="true",
+                candidate_sha=plan.sha,
+                candidate_version=plan.filename.removeprefix("luciole-").removesuffix(".ebuild"),
+            )
+            print_plan(plan)
+            if options.dry_run:
+                print("Dry run. No candidate files created.")
+            else:
+                staged = stage(package, parent, plan)
+                result["stage_dir"] = str(staged)
+                print(f"Staged candidate at {staged}")
+                print(INCOMPLETE)
+        if output is not None:
+            append_outputs(output, result)
     except (PreparationError, OSError) as error:
         print(f"Luciole preparation failed: {error}", file=sys.stderr)
         return 1
     return 0
+
+
+def append_outputs(output: Path, result: dict[str, str]) -> None:
+    if any("\r" in value or "\n" in value for value in result.values()):
+        raise PreparationError("Actions output values must fit on a single line.")
+    with output.open("a", encoding="utf-8") as stream:
+        stream.writelines(f"{name}={value}\n" for name, value in result.items())
 
 
 if __name__ == "__main__":
