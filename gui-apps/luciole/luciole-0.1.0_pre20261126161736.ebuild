@@ -6,7 +6,7 @@ EAPI=8
 PYTHON_COMPAT=( python3_{11..15} )
 inherit meson python-any-r1 xdg
 
-MY_COMMIT="5505f60d28a3919d4e0ec25d61db040e82151f0c"
+MY_COMMIT="94db0a89bbacd2480f4d890766d3603f866b3755"
 
 DESCRIPTION="Native Wayland file manager using the Noctalia UI library"
 HOMEPAGE="https://github.com/noctalia-dev/luciole"
